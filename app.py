@@ -7,6 +7,7 @@ import queue
 import platform
 import subprocess
 from pathlib import Path
+import signal
 
 import streamlit as st
 
@@ -103,13 +104,20 @@ def run_command_stream(command_str: str, cwd: Path):
         )
         shell_cmd = prelude + command_str
         popen_args = base + [shell_cmd]
-        creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        creationflags = 0
+        if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP'):
+            creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        preexec_fn = None
     else:
         # For bash/sh, ensure UTF-8 locale
         prelude = "export LANG=C.UTF-8; export LC_ALL=C.UTF-8;"
         shell_cmd = f"{prelude} {command_str}"
         popen_args = base + [shell_cmd]
         creationflags = 0
+        # Start new session so we can signal the whole group (os.killpg)
+        preexec_fn = os.setsid
 
     # Environment: enforce UTF-8 where possible
     env = os.environ.copy()
@@ -124,6 +132,7 @@ def run_command_stream(command_str: str, cwd: Path):
         universal_newlines=False,
         env=env,
         creationflags=creationflags,
+        preexec_fn=preexec_fn if not is_windows() else None,
     )
 
     st.session_state.proc = proc
@@ -159,11 +168,23 @@ def run_command_stream(command_str: str, cwd: Path):
     finally:
         # Wait for process to end if not already
         if proc.poll() is None:
-            # Try graceful terminate, then force kill; also reap children if possible
+            # Try graceful group interrupt first
             try:
-                proc.terminate()
+                if is_windows():
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    except Exception:
+                        proc.terminate()
+                else:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
             except Exception:
-                pass
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
             try:
                 proc.wait(timeout=2)
             except Exception:
@@ -192,12 +213,57 @@ def run_command_stream(command_str: str, cwd: Path):
                 pass
         except Exception:
             pass
-        st.session_state.running = False
-        st.session_state.proc = None
-
         # Report exit code
         rc = proc.returncode
         yield f"\n[exit {rc}]".encode()
+
+
+# --------------------- Key combo sender ---------------------
+def send_key_combo(combo: str) -> tuple[bool, str]:
+    """Send a key combo (like Ctrl+C) to the running process. Returns (ok, message)."""
+    proc = st.session_state.get("proc")
+    if not proc or st.session_state.get("running") is not True or proc.poll() is not None:
+        return False, "No command is currently running"
+
+    try:
+        if is_windows():
+            # Windows: try console control events; fall back to terminate
+            if combo == "ctrl_c":
+                try:
+                    proc.send_signal(signal.CTRL_C_EVENT)
+                    return True, "Sent Ctrl+C"
+                except Exception:
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        return True, "Sent Ctrl+Break"
+                    except Exception:
+                        proc.terminate()
+                        return True, "Attempted to terminate the process"
+            elif combo == "ctrl_break":
+                try:
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    return True, "Sent Ctrl+Break"
+                except Exception:
+                    proc.terminate()
+                    return True, "Attempted to terminate the process"
+            else:
+                return False, "This key combo is not supported on this system"
+        else:
+            # POSIX: signal process group
+            pgid = os.getpgid(proc.pid)
+            if combo == "ctrl_c":
+                os.killpg(pgid, signal.SIGINT)
+                return True, "Sent Ctrl+C (SIGINT)"
+            elif combo == "ctrl_z":
+                os.killpg(pgid, signal.SIGTSTP)
+                return True, "Sent Ctrl+Z (SIGTSTP)"
+            elif combo == "ctrl_backslash":
+                os.killpg(pgid, signal.SIGQUIT)
+                return True, "Sent Ctrl+\\ (SIGQUIT)"
+            else:
+                return False, "Unsupported key combo"
+    except Exception as e:
+        return False, f"Failed to send: {e}"
 
 
 # --------------------- Builtins ---------------------
@@ -250,11 +316,33 @@ def main():
             if st.session_state.running:
                 if st.button("Stop", type="secondary", use_container_width=True):
                     st.session_state.stop_token.set()
+                    # Don't touch running/proc here; they will be cleaned after stream ends
             else:
                 st.button("Stop", type="secondary", use_container_width=True, disabled=True)
         with col2:
             if st.button("Clear Chat", type="secondary", use_container_width=True):
                 st.session_state.messages = []
+
+        st.divider()
+        st.write("Send key combo to current console:")
+        if is_windows():
+            combo_label_map = {
+                "ctrl_c": "Ctrl+C (interrupt/terminate)",
+                "ctrl_break": "Ctrl+Break (interrupt)",
+            }
+        else:
+            combo_label_map = {
+                "ctrl_c": "Ctrl+C (SIGINT)",
+                "ctrl_z": "Ctrl+Z (SIGTSTP)",
+                "ctrl_backslash": "Ctrl+\\ (SIGQUIT)",
+            }
+        combo_key = st.selectbox("Key combo", options=list(combo_label_map.keys()), format_func=lambda k: combo_label_map[k], index=0)
+        if st.button("Send", use_container_width=True):
+            ok, msg = send_key_combo(combo_key)
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
 
         st.divider()
         up = st.file_uploader("Upload file(s)", accept_multiple_files=True)
@@ -359,6 +447,10 @@ def main():
                 out_area.code(rendered, language="bash")
                 # Small yield to UI
                 time.sleep(0.01)
+
+            # Cleanup process state here (outside generator) to avoid StopException
+            st.session_state.running = False
+            st.session_state.proc = None
 
             # Persist the final output to history
             try:
